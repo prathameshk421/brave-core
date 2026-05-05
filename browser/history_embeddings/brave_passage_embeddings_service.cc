@@ -7,7 +7,6 @@
 
 #include <utility>
 
-#include "base/barrier_closure.h"
 #include "base/check.h"
 #include "base/containers/flat_map.h"
 #include "base/feature_list.h"
@@ -266,11 +265,6 @@ BravePassageEmbeddingsService::BravePassageEmbeddingsService(
       updater_state_(updater_state) {
   CHECK(base::FeatureList::IsEnabled(history_embeddings::kHistoryEmbeddings));
   CHECK(updater_state_);
-  // Arm the barrier FIRST so CountComponentReadyOnce can route through
-  // it. AddObserver's immediate-notify (when install_dir is already
-  // set) will invoke OnLocalModelsReady synchronously; the flag guard
-  // inside CountComponentReadyOnce keeps that from counting twice.
-  MaybeWaitForLocalModelFilesReady();
   updater_state_->AddObserver(this);
 }
 
@@ -323,7 +317,7 @@ void BravePassageEmbeddingsService::BindPassageEmbedder(
   load.callback = std::move(callback);
   pending_loads_.push_back(std::move(load));
 
-  if (model_ready_ && factory_.is_bound()) {
+  if (phase_ == LoadPhase::kReady) {
     FulfillPendingLoads();
   }
 }
@@ -359,14 +353,12 @@ void BravePassageEmbeddingsService::RegisterPassageEmbedderFactory(
   factory_.set_disconnect_handler(
       base::BindOnce(&BravePassageEmbeddingsService::OnFactoryDisconnected,
                      weak_ptr_factory_.GetWeakPtr()));
-  if (model_load_barrier_) {
-    model_load_barrier_.Run();
-  }
+  MaybeLoadLocalModelFiles();
 }
 
 void BravePassageEmbeddingsService::OnLocalModelsReady(
     const base::FilePath& install_dir) {
-  CountComponentReadyOnce();
+  MaybeLoadLocalModelFiles();
 }
 
 void BravePassageEmbeddingsService::OnBackgroundContentsDestroyed(
@@ -398,32 +390,21 @@ void BravePassageEmbeddingsService::CloseBackgroundContents() {
   DVLOG(3) << "CloseBackgroundContents (pending_loads=" << pending_loads_.size()
            << " batch_embedder=" << (batch_embedder_ ? "set" : "null")
            << " factory_bound=" << factory_.is_bound()
-           << " model_ready=" << model_ready_
+           << " phase=" << static_cast<int>(phase_)
            << " bg_contents=" << (background_web_contents_ ? "set" : "null")
            << ")";
   ResetEmbedderState();
   background_web_contents_.reset();
 }
 
-void BravePassageEmbeddingsService::MaybeWaitForLocalModelFilesReady() {
-  component_ready_counted_ = false;
-  model_load_barrier_ = base::BarrierClosure(
-      2, base::BindOnce(&BravePassageEmbeddingsService::LoadLocalModelFiles,
-                        weak_ptr_factory_.GetWeakPtr()));
-  if (!updater_state_->GetInstallDir().empty()) {
-    CountComponentReadyOnce();
-  }
-}
-
-void BravePassageEmbeddingsService::CountComponentReadyOnce() {
-  if (component_ready_counted_ || !model_load_barrier_) {
+void BravePassageEmbeddingsService::MaybeLoadLocalModelFiles() {
+  if (phase_ != LoadPhase::kWaiting) {
     return;
   }
-  component_ready_counted_ = true;
-  model_load_barrier_.Run();
-}
-
-void BravePassageEmbeddingsService::LoadLocalModelFiles() {
+  if (updater_state_->GetInstallDir().empty() || !factory_.is_bound()) {
+    return;
+  }
+  phase_ = LoadPhase::kLoading;
   base::FilePath weights_path = updater_state_->GetEmbeddingGemmaModel();
   base::FilePath weights_dense1_path =
       updater_state_->GetEmbeddingGemmaDense1();
@@ -454,6 +435,7 @@ void BravePassageEmbeddingsService::OnLocalModelFilesLoaded(
     OnFactoryInitDone(false);
     return;
   }
+  phase_ = LoadPhase::kInitializing;
   factory_->Init(
       std::move(model_files),
       base::BindOnce(&BravePassageEmbeddingsService::OnFactoryInitDone,
@@ -464,6 +446,7 @@ void BravePassageEmbeddingsService::OnFactoryInitDone(bool success) {
   if (!success) {
     DVLOG(1) << "Factory Init failed, failing " << pending_loads_.size()
              << " pending load(s)";
+    phase_ = LoadPhase::kFailed;
     // CloseBackgroundContents runs FailPendingLoads internally and
     // tears down the rest of the state, matching LocalAIService's
     // old OnPassageEmbedderReady(false) behavior.
@@ -472,12 +455,12 @@ void BravePassageEmbeddingsService::OnFactoryInitDone(bool success) {
   }
   DVLOG(3) << "Factory Init succeeded, fulfilling " << pending_loads_.size()
            << " pending load(s)";
-  model_ready_ = true;
+  phase_ = LoadPhase::kReady;
   FulfillPendingLoads();
 }
 
 void BravePassageEmbeddingsService::FulfillPendingLoads() {
-  if (!model_ready_ || !factory_.is_bound() || pending_loads_.empty()) {
+  if (phase_ != LoadPhase::kReady || pending_loads_.empty()) {
     return;
   }
 
@@ -525,8 +508,7 @@ void BravePassageEmbeddingsService::ResetEmbedderState() {
   batch_embedder_.reset();
   factory_.reset();
   FailPendingLoads();
-  model_ready_ = false;
-  MaybeWaitForLocalModelFilesReady();
+  phase_ = LoadPhase::kWaiting;
 }
 
 void BravePassageEmbeddingsService::OnFactoryDisconnected() {
