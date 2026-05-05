@@ -64,6 +64,7 @@ class Widget;
 }  // namespace views
 
 class BraveBrowser;
+class BraveShieldsToolbarButton;
 class BraveHelpBubbleHostView;
 class BraveMultiContentsView;
 class ContentsLayoutManager;
@@ -166,6 +167,12 @@ class BraveBrowserView : public BrowserView,
   SidebarContainerView* sidebar_container_view() {
     return sidebar_container_view_;
   }
+
+#if BUILDFLAG(ENABLE_EXTENSIONS)
+  // Returns the PWA Shields toolbar button, if it exists. Note that this
+  // returns valid pointer only when it's web app browser.
+  BraveShieldsToolbarButton* GetPwaShieldsToolbarButton();
+#endif
 
  private:
   class TabCyclingEventHandler;
