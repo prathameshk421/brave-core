@@ -13,6 +13,7 @@
 #include "brave/browser/ui/tabs/brave_tab_prefs.h"
 #include "brave/browser/ui/views/frame/brave_browser_view.h"
 #include "brave/browser/ui/views/location_bar/brave_location_bar_view.h"
+#include "brave/browser/ui/views/tabs/vertical_tab_utils.h"
 #include "brave/browser/ui/views/toolbar/bookmark_button.h"
 #include "brave/browser/ui/views/toolbar/side_panel_button.h"
 #include "brave/components/ai_chat/core/common/buildflags/buildflags.h"
@@ -604,4 +605,50 @@ IN_PROC_BROWSER_TEST_F(BraveToolbarViewTest,
   // Disable vertical tabs - button should be hidden again.
   prefs->SetBoolean(brave_tabs::kVerticalTabsEnabled, false);
   EXPECT_FALSE(button->GetVisible());
+}
+
+// Verifies that UpdateHorizontalPadding() keeps the toolbar container border
+// in sync with GetLeadingTrailingCaptionButtonWidth() across state changes.
+// Guards against the Qt-theme regression where a fixed estimate was used
+// instead of real button bounds, causing caption buttons to overlap the
+// toolbar.
+IN_PROC_BROWSER_TEST_F(BraveToolbarViewTest,
+                       ToolbarPaddingMatchesFrameLayoutParams) {
+  auto* browser_widget =
+      BrowserView::GetBrowserViewForBrowser(browser())->browser_widget();
+  auto* container_view = toolbar_view_->location_bar_view()->parent();
+  auto* prefs = browser()->profile()->GetPrefs();
+
+  // Default: vertical tabs disabled — no border.
+  EXPECT_FALSE(container_view->GetBorder())
+      << "default state (vertical tabs disabled)";
+
+  // Enable vertical tabs, hide title bar.
+  prefs->SetBoolean(brave_tabs::kVerticalTabsEnabled, true);
+  prefs->SetBoolean(brave_tabs::kVerticalTabsShowTitleOnWindow, false);
+  RunScheduledLayouts();
+
+  auto [expected_left, expected_right] =
+      tabs::utils::GetLeadingTrailingCaptionButtonWidth(browser_widget);
+
+  // If both exclusions are zero (headless / no caption buttons) the early-
+  // return optimisation may leave the border as null — treat null as zero.
+  const auto* border = container_view->GetBorder();
+  const gfx::Insets actual = border ? border->GetInsets() : gfx::Insets();
+  EXPECT_EQ(actual.left(), expected_left)
+      << "after enabling vertical tabs, hiding title bar";
+  EXPECT_EQ(actual.right(), expected_right)
+      << "after enabling vertical tabs, hiding title bar";
+
+  // Show title bar → padding cleared.
+  prefs->SetBoolean(brave_tabs::kVerticalTabsShowTitleOnWindow, true);
+  RunScheduledLayouts();
+  EXPECT_FALSE(container_view->GetBorder())
+      << "after enabling vertical tabs, showing title bar";
+
+  // Hide title bar again, then disable vertical tabs → padding cleared.
+  prefs->SetBoolean(brave_tabs::kVerticalTabsShowTitleOnWindow, false);
+  prefs->SetBoolean(brave_tabs::kVerticalTabsEnabled, false);
+  RunScheduledLayouts();
+  EXPECT_FALSE(container_view->GetBorder()) << "after disabling vertical tabs";
 }

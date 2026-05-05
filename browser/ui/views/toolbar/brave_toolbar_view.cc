@@ -496,13 +496,20 @@ void BraveToolbarView::UpdateHorizontalPadding() {
   if (!tabs::utils::ShouldShowBraveVerticalTabs(browser()) ||
       tabs::utils::ShouldShowWindowTitleForVerticalTabs(browser())) {
     container_view->SetBorder(nullptr);
-  } else {
-    auto [leading, trailing] =
-        tabs::utils::GetLeadingTrailingCaptionButtonWidth(
-            browser_view_->browser_widget());
-    container_view->SetBorder(views::CreateEmptyBorder(
-        gfx::Insets().set_left(leading).set_right(trailing)));
+    return;
   }
+
+  const gfx::Insets current_insets = container_view->GetInsets();
+  auto [leading, trailing] = tabs::utils::GetLeadingTrailingCaptionButtonWidth(
+      browser_view_->browser_widget());
+
+  // Skip the SetBorder() call if insets are already correct. Layout triggers
+  // this method and SetBorder() would invalidate layout again, causing a loop.
+  if (current_insets.left() == leading && current_insets.right() == trailing) {
+    return;
+  }
+  container_view->SetBorder(views::CreateEmptyBorder(
+      gfx::Insets().set_left(leading).set_right(trailing)));
 }
 
 void BraveToolbarView::ShowBookmarkBubble(const GURL& url,
