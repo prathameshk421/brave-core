@@ -95,7 +95,10 @@ class MockToolProvider : public ToolProvider {
   MockToolProvider() = default;
   ~MockToolProvider() override = default;
 
-  MOCK_METHOD(void, OnNewGenerationLoop, (), (override));
+  MOCK_METHOD(void,
+              UpdateToolsForNewGenerationLoop,
+              (base::OnceClosure),
+              (override));
   MOCK_METHOD(void, OnGenerationCompleteWithNoToolsToHandle, (), (override));
   MOCK_METHOD(std::vector<base::WeakPtr<Tool>>, GetTools, (), (override));
   MOCK_METHOD(void, StopAllTasks, (), (override));
@@ -266,6 +269,10 @@ class ConversationHandlerUnitTest : public testing::Test {
     ON_CALL(*mock_tool_provider_, GetTools()).WillByDefault([]() {
       return std::vector<base::WeakPtr<Tool>>();
     });
+
+    // Invoke the callback immediately by default
+    ON_CALL(*mock_tool_provider_, UpdateToolsForNewGenerationLoop)
+        .WillByDefault([](base::OnceClosure cb) { std::move(cb).Run(); });
 
     conversation_handler_->SetEngineForTesting(
         std::make_unique<NiceMock<MockEngineConsumer>>());
@@ -3571,9 +3578,10 @@ TEST_F(ConversationHandlerUnitTest, ToolUseEvents_MultipleToolIterations) {
 
   // Expect our tool provider will be informed of the new generation loop
   // starting when the initial message is submitted.
-  EXPECT_CALL(*mock_tool_provider_, OnNewGenerationLoop)
+  EXPECT_CALL(*mock_tool_provider_, UpdateToolsForNewGenerationLoop)
       .Times(1)
-      .InSequence(seq);
+      .InSequence(seq)
+      .WillOnce([](base::OnceClosure cb) { std::move(cb).Run(); });
 
   EXPECT_CALL(*engine, GenerateAssistantResponse)
       .InSequence(seq)
@@ -3707,6 +3715,51 @@ TEST_F(ConversationHandlerUnitTest, ToolUseEvents_MultipleToolIterations) {
 
   // Final response should be present
   EXPECT_EQ(history.back()->text, "Final response after tools");
+}
+
+// Verifies that generation is deferred until UpdateToolsForNewGenerationLoop
+// invokes its callback. This tests the async contract added so that providers
+// can do async work (e.g. fetching available tools) before generation starts.
+TEST_F(ConversationHandlerUnitTest,
+       UpdateToolsForNewGenerationLoop_DeferredGeneration) {
+  conversation_handler_->associated_content_manager()->ClearContent();
+  MockEngineConsumer* engine = static_cast<MockEngineConsumer*>(
+      conversation_handler_->GetEngineForTesting());
+
+  // Simulate async provider work by posting the callback as a task, so it is
+  // not invoked synchronously.
+  EXPECT_CALL(*mock_tool_provider_, UpdateToolsForNewGenerationLoop)
+      .WillOnce([](base::OnceClosure cb) {
+        base::SequencedTaskRunner::GetCurrentDefault()->PostTask(FROM_HERE,
+                                                                 std::move(cb));
+      });
+
+  bool generation_started = false;
+  base::RunLoop run_loop;
+  EXPECT_CALL(*engine, GenerateAssistantResponse)
+      .Times(1)
+      .WillOnce(testing::DoAll(
+          testing::InvokeWithoutArgs([&] { generation_started = true; }),
+          testing::WithArg<7>(
+              [&](EngineConsumer::GenerationCompletedCallback callback) {
+                std::move(callback).Run(
+                    base::ok(EngineConsumer::GenerationResultData(
+                        mojom::ConversationEntryEvent::NewCompletionEvent(
+                            mojom::CompletionEvent::New("response")),
+                        std::nullopt)));
+                run_loop.Quit();
+              })));
+
+  conversation_handler_->SubmitHumanConversationEntry("hello", std::nullopt);
+
+  // The callback should not have been invoked yet, so generation should not
+  // have started.
+  EXPECT_FALSE(generation_started);
+
+  // Pumping the run loop delivers the posted task, fires the callback, and
+  // generation proceeds and completes.
+  run_loop.Run();
+  EXPECT_TRUE(generation_started);
 }
 
 TEST_F(ConversationHandlerUnitTest, ToolUseEvents_ToolNotFound) {
@@ -6204,6 +6257,8 @@ TEST_F(ConversationHandlerUnitTest, ConversationCapabilities) {
     ON_CALL(*mock_tool_provider_, GetTools()).WillByDefault([]() {
       return std::vector<base::WeakPtr<Tool>>();
     });
+    ON_CALL(*mock_tool_provider_, UpdateToolsForNewGenerationLoop)
+        .WillByDefault([](base::OnceClosure cb) { std::move(cb).Run(); });
     conversation_handler_->SetEngineForTesting(
         std::make_unique<NiceMock<MockEngineConsumer>>());
     EmulateUserOptedIn();
