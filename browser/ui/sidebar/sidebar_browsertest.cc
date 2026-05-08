@@ -81,8 +81,11 @@
 #include "ui/display/test/test_screen.h"
 #include "ui/events/base_event_utils.h"
 #include "ui/events/event.h"
+#include "ui/events/test/event_generator.h"
 #include "ui/gfx/animation/animation_test_api.h"
 #include "ui/gfx/geometry/point.h"
+#include "ui/views/animation/ink_drop.h"
+#include "ui/views/widget/widget_utils.h"
 
 #if BUILDFLAG(ENABLE_AI_CHAT)
 #include "brave/components/ai_chat/core/common/features.h"
@@ -2331,6 +2334,122 @@ IN_PROC_BROWSER_TEST_F(SidebarBrowserTest,
               Show(testing::An<SidePanelEntryId>(), testing::Eq(std::nullopt),
                    /*suppress_animations=*/true));
   controller()->ActivatePanelItem(SidebarItem::BuiltInItemType::kReadingList);
+}
+
+// In V2, the toolbar SidePanelButton acts as a "temporal pin" for the sidebar
+// control view: clicking it toggles a session-only pinned state that forces
+// the sidebar visible regardless of show option. The pinned state must reset
+// when the show option changes. The button is hidden under kShowAlways
+// because the sidebar is already always visible.
+IN_PROC_BROWSER_TEST_F(SidebarBrowserTest, SidebarV2ToolbarButtonPinning) {
+  auto* service = SidebarServiceFactory::GetForProfile(browser()->profile());
+  auto* sidebar_container = GetSidebarContainerView();
+  auto* button = GetSidePanelToolbarButton();
+  ASSERT_TRUE(button);
+  auto button_highlighted = [&]() {
+    return views::InkDrop::Get(button)->GetHighlighted();
+  };
+
+  // Park the mouse at the top of the toolbar — well outside the sidebar
+  // bounds — so that kShowOnMouseOver doesn't keep the sidebar visible due
+  // to an incidental hover. Without this the test is sensitive to wherever
+  // the OS leaves the cursor between runs.
+  auto* browser_view = BrowserView::GetBrowserViewForBrowser(browser());
+  ui::test::EventGenerator event_generator(
+      views::GetRootWindow(browser_view->GetWidget()),
+      browser_view->GetNativeWindow());
+  event_generator.MoveMouseTo(
+      browser_view->toolbar()->GetBoundsInScreen().CenterPoint());
+  ASSERT_FALSE(sidebar_container->IsMouseHovered())
+      << "Mouse should not be over the sidebar at test start";
+
+  // Pin → assert visible/highlighted; unpin → assert hidden/unhighlighted.
+  // Precondition: pinned=false, sidebar hidden. Used once per non-kShowAlways
+  // show option. SCOPED_TRACE makes failures point back to the caller.
+  auto verify_pin_cycle = [&]() {
+    ASSERT_FALSE(controller()->sidebar_pinned())
+        << "Precondition: pinned=false before pin";
+    ASSERT_FALSE(sidebar_container->IsSidebarVisible())
+        << "Precondition: sidebar hidden before pin";
+    ASSERT_FALSE(button_highlighted())
+        << "Precondition: button not highlighted before pin";
+
+    // Pin: sidebar snaps visible, button highlights (fade-in).
+    controller()->ToggleSidebarPinning();
+    EXPECT_TRUE(controller()->sidebar_pinned()) << "Pin should set pinned=true";
+    EXPECT_TRUE(sidebar_container->IsSidebarVisible())
+        << "Pin should force sidebar visible regardless of show option";
+    ASSERT_TRUE(base::test::RunUntil([&]() { return button_highlighted(); }))
+        << "Pin should highlight the toolbar button";
+
+    // Unpin: pinned flips immediately; button highlight + sidebar visibility
+    // unwind asynchronously (animations).
+    controller()->ToggleSidebarPinning();
+    EXPECT_FALSE(controller()->sidebar_pinned())
+        << "Unpin should set pinned=false";
+    ASSERT_TRUE(base::test::RunUntil([&]() { return !button_highlighted(); }))
+        << "Unpin should clear the button highlight";
+    ASSERT_TRUE(base::test::RunUntil([&]() {
+      return !sidebar_container->IsSidebarVisible();
+    })) << "Unpin should hide the sidebar (current show option doesn't keep "
+           "it visible without pin)";
+  };
+
+  // kShowAlways (the fixture default) → button is hidden because the sidebar
+  // is always visible.
+  ASSERT_EQ(SidebarService::ShowSidebarOption::kShowAlways,
+            service->GetSidebarShowOption());
+  EXPECT_FALSE(button->GetVisible())
+      << "Toolbar button must be hidden under kShowAlways";
+
+  // Switch to kShowNever so the button becomes visible and the sidebar hides.
+  service->SetSidebarShowOption(SidebarService::ShowSidebarOption::kShowNever);
+  EXPECT_TRUE(button->GetVisible())
+      << "Toolbar button must be visible under kShowNever";
+  ASSERT_TRUE(base::test::RunUntil([&]() {
+    return !sidebar_container->IsSidebarVisible();
+  })) << "Sidebar should hide after switching to kShowNever";
+
+  {
+    SCOPED_TRACE("kShowNever");
+    verify_pin_cycle();
+  }
+
+  // Pin again, then change the show option → pinned must reset to false and
+  // the sidebar must follow the new option (kShowOnMouseOver, mouse parked
+  // outside sidebar → hidden).
+  controller()->ToggleSidebarPinning();
+  ASSERT_TRUE(controller()->sidebar_pinned())
+      << "Pinning again should set pinned=true (precondition for reset test)";
+  ASSERT_TRUE(sidebar_container->IsSidebarVisible())
+      << "Sidebar should be visible while pinned (precondition)";
+  ASSERT_TRUE(base::test::RunUntil([&]() { return button_highlighted(); }))
+      << "Button should be highlighted while pinned (precondition)";
+
+  service->SetSidebarShowOption(
+      SidebarService::ShowSidebarOption::kShowOnMouseOver);
+  EXPECT_FALSE(controller()->sidebar_pinned())
+      << "Changing show option must reset pinned state to false";
+  EXPECT_TRUE(button->GetVisible())
+      << "Toolbar button must be visible under kShowOnMouseOver";
+  ASSERT_TRUE(base::test::RunUntil([&]() { return !button_highlighted(); }))
+      << "Button highlight should fade off after pinned reset";
+  ASSERT_TRUE(base::test::RunUntil([&]() {
+    return !sidebar_container->IsSidebarVisible();
+  })) << "Sidebar should hide once pinned is reset under kShowOnMouseOver "
+         "(mouse is not over sidebar in tests)";
+
+  {
+    SCOPED_TRACE("kShowOnMouseOver");
+    verify_pin_cycle();
+  }
+
+  // Switching back to kShowAlways re-hides the toolbar button.
+  service->SetSidebarShowOption(SidebarService::ShowSidebarOption::kShowAlways);
+  EXPECT_FALSE(button->GetVisible())
+      << "Toolbar button must be hidden again under kShowAlways";
+  EXPECT_FALSE(controller()->sidebar_pinned())
+      << "Pinned state must remain false after returning to kShowAlways";
 }
 
 #endif  // BUILDFLAG(ENABLE_SIDEBAR_V2)
