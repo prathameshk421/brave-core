@@ -2269,6 +2269,13 @@ struct PolkadotAccountInfo {
   PolkadotAccountBalance data;
 };
 
+enum PolkadotValidationStatus {
+  kNoError = 0,
+  kInvalidPrefix = 1,
+  kInvalidAddressFormat = 2,
+  kFailedToFetchMetadata = 3,
+};
+
 interface PolkadotWalletService {
   GetNetworkName(AccountId account)
       => (string? network, string? error_message);
@@ -2280,6 +2287,9 @@ interface PolkadotWalletService {
 
   GetAccountBalance(AccountId account, string chain_id)
       => (PolkadotAccountInfo? account, string? error_message);
+
+  ValidateAddressForTransaction(string chain_id, string address)
+      => (PolkadotValidationStatus status);
 };
 
 enum TransactionStatus {
